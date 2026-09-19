@@ -39,11 +39,17 @@ jobs:
     with:
       modrinth: ${{ inputs.modrinth || false }}
       curseforge: ${{ inputs.curseforge || false }}
+      modrinth_id: ${{ vars.MODRINTH_ID || secrets.MODRINTH_ID }}
+      curseforge_id: ${{ vars.CURSEFORGE_ID || secrets.CURSEFORGE_ID }}
     secrets: inherit
 ```
 
 `|| false` is needed because `inputs.*` is null on a tag push, and a null would
 fail the boolean type check.
+
+The project ids are passed explicitly because a called workflow cannot see the
+caller's `vars` — only `secrets: inherit` crosses that boundary automatically.
+The `vars.X || secrets.X` form means a repo can hold its ids either way.
 
 ## What each mod must provide
 
@@ -64,12 +70,16 @@ same stub.
 
 ## Secrets
 
-Set per mod repo, as **secrets** (not `vars` — a called workflow can't see the
-caller's `vars` unless they're passed explicitly, whereas `secrets: inherit`
-covers all of these at once):
+Set per mod repo:
 
-- `MODRINTH_ID`, `MODRINTH_TOKEN`
-- `CURSEFORGE_ID`, `CURSEFORGE_TOKEN`
+| name | kind | notes |
+|---|---|---|
+| `MODRINTH_ID` | var (or secret) | passed in by the stub |
+| `CURSEFORGE_ID` | var (or secret) | passed in by the stub |
+| `MODRINTH_TOKEN` | **secret** | via `secrets: inherit` |
+| `CURSEFORGE_TOKEN` | **secret** | via `secrets: inherit` |
+
+The ids are ordinary repo variables; the tokens must be secrets.
 
 A missing *token* means that target is skipped, so a fork still builds and
 makes a GitHub release. A token set with an empty *id* fails loudly rather than
