@@ -39,8 +39,8 @@ jobs:
     with:
       modrinth: ${{ inputs.modrinth || false }}
       curseforge: ${{ inputs.curseforge || false }}
-      modrinth_id: ${{ vars.MODRINTH_ID || secrets.MODRINTH_ID }}
-      curseforge_id: ${{ vars.CURSEFORGE_ID || secrets.CURSEFORGE_ID }}
+      modrinth_id: ${{ vars.MODRINTH_ID }}
+      curseforge_id: ${{ vars.CURSEFORGE_ID }}
     secrets: inherit
 ```
 
@@ -49,7 +49,13 @@ fail the boolean type check.
 
 The project ids are passed explicitly because a called workflow cannot see the
 caller's `vars` — only `secrets: inherit` crosses that boundary automatically.
-The `vars.X || secrets.X` form means a repo can hold its ids either way.
+
+If a repo holds its ids as **secrets** rather than vars, leave those two lines
+out: the pipeline falls back to `secrets.MODRINTH_ID` / `secrets.CURSEFORGE_ID`
+on its own side. The fallback can't live in the stub, because the `secrets`
+context is not available in a caller's `with:` block — only `github`, `needs`,
+`strategy`, `matrix`, `inputs` and `vars` are, and using `secrets` there fails
+the whole workflow at validation time, before any job is scheduled.
 
 ## What each mod must provide
 

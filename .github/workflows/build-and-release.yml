@@ -51,8 +51,11 @@ on:
         default: '25'
       # The project ids aren't secret, and are normally repo `vars`. A called
       # workflow can't see the caller's `vars` at all, so the stub passes them
-      # in explicitly, falling back to a same-named secret for repos that hold
-      # them that way. The tokens are always secrets, via `secrets: inherit`.
+      # in explicitly. A repo that holds its ids as secrets instead leaves
+      # these empty, and the release jobs fall back to secrets.*_ID -- the
+      # fallback has to happen HERE rather than in the stub, because the
+      # `secrets` context is not available in a caller's `with:` block (only
+      # github, needs, strategy, matrix, inputs and vars are).
       modrinth_id:
         description: "Modrinth project id (caller's vars.MODRINTH_ID, or secret)"
         type: string
@@ -65,6 +68,12 @@ on:
       MODRINTH_TOKEN:
         required: false
       CURSEFORGE_TOKEN:
+        required: false
+      # Only used as a fallback when the caller has no vars.*_ID to pass as an
+      # input; declared so `secrets: inherit` can supply them.
+      MODRINTH_ID:
+        required: false
+      CURSEFORGE_ID:
         required: false
 
 jobs:
@@ -325,7 +334,7 @@ jobs:
         loader: ${{ fromJson(needs.build.outputs.loaders) }}
     env:
       VERSION: ${{ needs.build.outputs.version }}
-      MODRINTH_ID: ${{ inputs.modrinth_id }}
+      MODRINTH_ID: ${{ inputs.modrinth_id || secrets.MODRINTH_ID }}
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
     steps:
       - name: Checkout
@@ -346,7 +355,7 @@ jobs:
       - name: Check Modrinth config
         if: ${{ env.MODRINTH_TOKEN != '' && env.MODRINTH_ID == '' }}
         run: |
-          echo "::error::MODRINTH_TOKEN is set but MODRINTH_ID is empty -- nothing would be published. Pass modrinth_id from the caller (vars.MODRINTH_ID or secrets.MODRINTH_ID)."
+          echo "::error::MODRINTH_TOKEN is set but no Modrinth project id was found -- nothing would be published. Set vars.MODRINTH_ID (or secrets.MODRINTH_ID) on the calling repo."
           exit 1
 
       - name: Publish to Modrinth
@@ -383,7 +392,7 @@ jobs:
         loader: ${{ fromJson(needs.build.outputs.loaders) }}
     env:
       VERSION: ${{ needs.build.outputs.version }}
-      CURSEFORGE_ID: ${{ inputs.curseforge_id }}
+      CURSEFORGE_ID: ${{ inputs.curseforge_id || secrets.CURSEFORGE_ID }}
       CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
     steps:
       - name: Checkout
@@ -418,7 +427,7 @@ jobs:
       - name: Check CurseForge config
         if: ${{ env.CURSEFORGE_TOKEN != '' && env.CURSEFORGE_ID == '' }}
         run: |
-          echo "::error::CURSEFORGE_TOKEN is set but CURSEFORGE_ID is empty -- nothing would be published. Pass curseforge_id from the caller (vars.CURSEFORGE_ID or secrets.CURSEFORGE_ID)."
+          echo "::error::CURSEFORGE_TOKEN is set but no CurseForge project id was found -- nothing would be published. Set vars.CURSEFORGE_ID (or secrets.CURSEFORGE_ID) on the calling repo."
           exit 1
 
       - name: Publish to CurseForge
