@@ -24,6 +24,9 @@
 #
 #   26.0.3            public release     GitHub release + Modrinth + CurseForge
 #   26.0.3-pre1       github prerelease  GitHub release only, marked prerelease
+#   26.0.3+1          github prerelease  ditto -- a rebuild of an already
+#                                        released version (semver build
+#                                        metadata; never reaches the mod sites)
 #   workflow-update-* anything else      build only, nothing published
 #
 #   manual dispatch   build + a prerelease GitHub release; Modrinth and
@@ -84,8 +87,12 @@ jobs:
   # it's called.
   #
   #   release    a plain version, e.g. 26.0.3 -- publish everywhere
-  #   prerelease a version with a suffix, e.g. 26.0.3-pre1 -- GitHub only,
-  #              flagged as a prerelease
+  #   prerelease a version with a -suffix (26.0.3-pre1) or +build metadata
+  #              (26.0.3+1) -- GitHub only, flagged as a prerelease. Semver
+  #              says +build is ignored for precedence, i.e. 26.0.3+1 IS
+  #              26.0.3, so it must never reach Modrinth/CurseForge: they
+  #              would carry two entries claiming to be the same version.
+  #              It exists for rebuilding an already-released version.
   #   (neither)  any other tag, e.g. workflow-update-26.0.2 -- build only
   #
   # A manual dispatch counts as a prerelease, so a test build never looks
@@ -113,7 +120,7 @@ jobs:
           if [ "$IS_TAG" = "true" ]; then
             if printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
               gh=true; mr=true; cf=true            # public release
-            elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?-[A-Za-z0-9_]+$'; then
+            elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9_]+|\+[0-9]+)$'; then
               gh=true; pre=true                    # github prerelease
             fi                                     # else: build only
           else

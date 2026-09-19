@@ -103,13 +103,20 @@ Every tag builds. The tag's shape decides what gets published:
 |---|---|---|---|
 | tag `26.0.3` | yes | yes | yes |
 | tag `26.0.3-pre1` | yes | yes, as a **prerelease** | no |
+| tag `26.0.3+1` | yes | yes, as a **prerelease** | no |
 | tag `workflow-update-26.0.2` | yes | no | no |
 | manual dispatch | yes | yes, as a **prerelease** | only if ticked |
 
 Tag patterns are strict: `^[0-9]+\.[0-9]+(\.[0-9]+)?$` for a release and
-`^[0-9]+\.[0-9]+(\.[0-9]+)?-[A-Za-z0-9_]+$` for a prerelease. `v26.0.3` and
-`26.0.3-pre.1` (dot in the suffix) match neither, so they build and publish
-nothing.
+`^[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9_]+|\+[0-9]+)$` for a prerelease.
+`v26.0.3` and `26.0.3-pre.1` (dot in the suffix) match neither, so they build
+and publish nothing.
+
+`+N` is semver build metadata: a rebuild of an already-released version, for
+testing CI without inventing a version number. Semver ignores it for
+precedence — `26.0.3+1` *is* `26.0.3` — so it is deliberately capped at a
+GitHub prerelease and never reaches Modrinth or CurseForge, which would
+otherwise carry two entries claiming to be the same version.
 
 On a version tag the **tag is authoritative**: the build passes
 `-Pmod_version=<tag>`, so jar names always match what the release jobs look
