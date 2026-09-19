@@ -1,0 +1,428 @@
+# Shared build-and-release pipeline for tomgidden's Minecraft mods.
+#
+# Called by each mod repo's own .github/workflows/build-and-release.yml, which
+# is a thin stub -- see README.md for the stub to copy. Everything that differs
+# between mods lives in the calling repo's .github/release/:
+#
+#   release.env   -- mod name, jar basename, release channel, game versions
+#   RELEASE.md    -- body of the GitHub release
+#   CHANGELOG.md  -- changelog sent to Modrinth and CurseForge
+#
+# ...or is discovered from the repo layout itself: which loaders get built is
+# decided by which of the fabric/ and neoforge/ subprojects are present, so a
+# Fabric-only mod and a Fabric+NeoForge mod call this unchanged.
+#
+# Build and release are separate jobs. release-github/-modrinth/-curseforge
+# each depend only on build's jars (via upload/download-artifact), not on each
+# other, so if e.g. Modrinth publishing fails, use GitHub's "Re-run failed
+# jobs" to retry just that job -- the build isn't repeated. (Re-running an old
+# run replays that run's workflow files, not the current ones, so a fix here
+# needs a new run to take effect.)
+#
+# What runs depends on how the caller was triggered, and on the tag's shape.
+# Every tag builds; the tag name decides only what gets published:
+#
+#   26.0.3            public release     GitHub release + Modrinth + CurseForge
+#   26.0.3-pre1       github prerelease  GitHub release only, marked prerelease
+#   workflow-update-* anything else      build only, nothing published
+#
+#   manual dispatch   build + a prerelease GitHub release; Modrinth and
+#                     CurseForge only if their box is ticked
+#
+# so an untagged run, or a tag that isn't a version number, is safe to use as
+# a test build: it publishes nothing to the mod sites unless asked.
+
+name: Build and Release (shared)
+
+on:
+  workflow_call:
+    inputs:
+      modrinth:
+        description: 'Also publish to Modrinth (manual runs only)'
+        type: boolean
+        default: false
+      curseforge:
+        description: 'Also publish to CurseForge (manual runs only)'
+        type: boolean
+        default: false
+      java-version:
+        description: 'JDK to build with'
+        type: string
+        default: '25'
+    secrets:
+      MODRINTH_ID:
+        required: false
+      MODRINTH_TOKEN:
+        required: false
+      CURSEFORGE_ID:
+        required: false
+      CURSEFORGE_TOKEN:
+        required: false
+
+jobs:
+  # Decides what this run is allowed to publish, so the release jobs can stay
+  # simple `if:` checks. GitHub's `on.push.tags` filter takes globs, not
+  # regexes, and expressions have no regex operator either, so the version
+  # shape is matched here in bash instead -- and every tag is built, whatever
+  # it's called.
+  #
+  #   release    a plain version, e.g. 26.0.3 -- publish everywhere
+  #   prerelease a version with a suffix, e.g. 26.0.3-pre1 -- GitHub only,
+  #              flagged as a prerelease
+  #   (neither)  any other tag, e.g. workflow-update-26.0.2 -- build only
+  #
+  # A manual dispatch counts as a prerelease, so a test build never looks
+  # like a real one.
+  #
+  # github.ref_type/ref_name refer to the CALLER's ref, so tags work here
+  # exactly as they did when this lived in the mod repo.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      github: ${{ steps.g.outputs.github }}
+      modrinth: ${{ steps.g.outputs.modrinth }}
+      curseforge: ${{ steps.g.outputs.curseforge }}
+      prerelease: ${{ steps.g.outputs.prerelease }}
+    steps:
+      - id: g
+        env:
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+          TAG: ${{ github.ref_name }}
+          WANT_MODRINTH: ${{ inputs.modrinth }}
+          WANT_CURSEFORGE: ${{ inputs.curseforge }}
+        run: |
+          gh=false; mr=false; cf=false; pre=false
+
+          if [ "$IS_TAG" = "true" ]; then
+            if printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+              gh=true; mr=true; cf=true            # public release
+            elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?-[A-Za-z0-9_]+$'; then
+              gh=true; pre=true                    # github prerelease
+            fi                                     # else: build only
+          else
+            gh=true; pre=true                      # manual dispatch
+            [ "$WANT_MODRINTH" = "true" ] && mr=true
+            [ "$WANT_CURSEFORGE" = "true" ] && cf=true
+          fi
+
+          {
+            echo "github=$gh"
+            echo "modrinth=$mr"
+            echo "curseforge=$cf"
+            echo "prerelease=$pre"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "::notice::tag='${TAG}' -> github=$gh modrinth=$mr curseforge=$cf prerelease=$pre"
+
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version-out.outputs.version }}
+      loaders: ${{ steps.loaders-out.outputs.loaders }}
+    steps:
+      # Checks out the CALLING mod repo at the ref that triggered the run --
+      # which is what actions/checkout does by default from a called workflow.
+      # (This workflow's own repo is never checked out; only its YAML is used.)
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'zulu'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # NeoForge's NFRT toolchain (downloaded/decompiled/patched Minecraft) and
+      # Loom's own cache are expensive to rebuild but only change when the
+      # pinned MC/loader/NeoForge versions do -- not on every source change --
+      # so they're cached separately from setup-gradle's build-cache, keyed on
+      # gradle.properties rather than the whole repo. The neoformruntime path
+      # is simply unused in repos with no neoforge/ subproject.
+      - name: Cache NeoForge/Loom toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches/neoformruntime
+            ~/.gradle/caches/fabric-loom
+            .gradle/loom-cache
+          key: toolchains-${{ runner.os }}-${{ hashFiles('gradle.properties') }}
+          restore-keys: |
+            toolchains-${{ runner.os }}-
+
+      # release.env is plain KEY=value, so it can be appended straight to the
+      # step environment.
+      #
+      # VERSION comes from the tag, but only when the tag is actually a version
+      # (gate said it was publishable). A tag like workflow-update-26.0.2 is a
+      # marker, not a version, and naming jars after it would produce
+      # <artifact>-fabric-workflow-update-26.0.2.jar; those runs fall back to
+      # mod_version from gradle.properties, as a manual dispatch does.
+      #
+      # The set of loaders is derived from the repo layout: a loader is built
+      # only if its subproject directory exists. GRADLE_TARGETS is the list of
+      # build tasks; HAS_FABRIC/HAS_NEOFORGE gate the later per-loader steps.
+      - name: Load release config
+        id: cfg
+        env:
+          TAG_IS_VERSION: ${{ needs.gate.outputs.github }}
+        run: |
+          if [ ! -f .github/release/release.env ]; then
+            echo "::error::.github/release/release.env not found in the calling repo."
+            exit 1
+          fi
+          cat .github/release/release.env >> "$GITHUB_ENV"
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "$TAG_IS_VERSION" = "true" ]; then
+            echo "VERSION=${{ github.ref_name }}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=$(sed -n 's/^mod_version=//p' gradle.properties)" >> "$GITHUB_ENV"
+          fi
+
+          targets=""
+          for loader in fabric neoforge; do
+            if [ -d "$loader" ]; then
+              targets="$targets :$loader:build"
+              echo "HAS_$(echo "$loader" | tr '[:lower:]' '[:upper:]')=true" >> "$GITHUB_ENV"
+            fi
+          done
+          if [ -z "$targets" ]; then
+            echo "::error::No fabric/ or neoforge/ subproject found -- nothing to build."
+            exit 1
+          fi
+          echo "GRADLE_TARGETS=${targets# }" >> "$GITHUB_ENV"
+
+      # -Pmod_version overrides gradle.properties so that on a tag build the
+      # tag is the single source of truth for the version, and the jars are
+      # named after it whatever the file says. (Jar names have to match what
+      # the release jobs glob for; a silent mismatch there produces an empty
+      # file list rather than an error.) gradle.properties still supplies the
+      # default for untagged builds, and a warning is emitted if it has
+      # drifted, so the drift gets noticed without failing a release.
+      - name: Check version against tag
+        if: ${{ github.ref_type == 'tag' && needs.gate.outputs.github == 'true' }}
+        run: |
+          in_file=$(sed -n 's/^mod_version=//p' gradle.properties)
+          if [ "$in_file" != "$VERSION" ]; then
+            echo "::warning::gradle.properties has mod_version=$in_file but the tag is $VERSION; building as $VERSION."
+          fi
+
+      - name: Build
+        run: ./gradlew $GRADLE_TARGETS -Pmod_version="$VERSION"
+
+      # Emitted as a job output (rather than left in $GITHUB_ENV) because env
+      # vars set in one job aren't visible in another -- the release jobs need
+      # VERSION and read it via needs.build.outputs.version.
+      - name: Set version output
+        id: version-out
+        run: echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Collects only the jars that were actually built (fabric and/or
+      # neoforge) into a single artifact the release jobs download, so none of
+      # them need to know the loader layout or re-run Gradle.
+      - name: Collect release files
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-files"
+          for loader in fabric neoforge; do
+            jar="$loader/build/libs/${ARTIFACT}-${loader}-${VERSION}.jar"
+            [ -f "$jar" ] && cp "$jar" "$RUNNER_TEMP/release-files/"
+          done
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-files
+          path: ${{ runner.temp }}/release-files/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      # Exposed as a job output so the per-loader release jobs can fan out
+      # with a matrix over only the loaders that were actually built.
+      - name: Set loaders output
+        id: loaders-out
+        run: |
+          loaders="[]"
+          for loader in fabric neoforge; do
+            jar="$loader/build/libs/${ARTIFACT}-${loader}-${VERSION}.jar"
+            [ -f "$jar" ] && loaders=$(echo "$loaders" | jq -c ". + [\"$loader\"]")
+          done
+          echo "loaders=$loaders" >> "$GITHUB_OUTPUT"
+
+  # Runs for a version tag (26.0.3 or 26.0.3-pre1) and for a manual dispatch,
+  # so a test build still leaves the jars somewhere downloadable -- but not for
+  # a non-version tag, which builds and stops.
+  #
+  # Marked as a prerelease whenever gate said so (a -suffix tag, or a manual
+  # dispatch), so a test build can't be mistaken for a real one. On a plain
+  # version tag, PRERELEASE from release.env decides as usual.
+  release-github:
+    needs: [gate, build]
+    if: ${{ needs.gate.outputs.github == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download release files
+        uses: actions/download-artifact@v6
+        with:
+          name: release-files
+          path: release-files
+
+      - name: Load release config
+        run: cat .github/release/release.env >> "$GITHUB_ENV"
+
+      # envsubst is restricted to ${VERSION} so any other $... in the prose
+      # (or a stray backtick-free shell-looking string) is left alone.
+      - name: Render release body
+        run: envsubst '${VERSION}' < .github/release/RELEASE.md > "$RUNNER_TEMP/release-body.md"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.MOD_NAME }} ${{ env.VERSION }}
+          body_path: ${{ runner.temp }}/release-body.md
+          files: release-files/*.jar
+          fail_on_unmatched_files: true
+          prerelease: ${{ needs.gate.outputs.prerelease == 'true' || env.PRERELEASE == 'true' }}
+
+  # mc-publish infers loaders/game-versions/dependencies from a single jar's
+  # own metadata (fabric.mod.json / neoforge.mods.toml) per call, so a
+  # multi-loader jar set can't be passed to one call -- it silently drops
+  # everything but one loader's metadata. Instead this fans out over a matrix
+  # of the loaders build actually produced, publishing one version per loader
+  # (matching the existing 26.2-fabric / 26.2-neoforge versions on Modrinth).
+  #
+  # Only runs for a plain version tag (26.0.3 -- not 26.0.3-pre1), or when a
+  # manual run explicitly ticks the Modrinth box; the step is additionally
+  # skipped when MODRINTH_TOKEN is unset, so a fork still builds and makes a
+  # GitHub release. (The token check has to be at step level: `secrets` is not
+  # available to a job-level `if:`.)
+  #
+  # The project ids are taken as secrets rather than `vars` so a caller can
+  # supply them either way: `vars` are not visible to a called workflow unless
+  # passed in, whereas `secrets: inherit` covers the secret case automatically.
+  release-modrinth:
+    needs: [gate, build]
+    if: ${{ needs.gate.outputs.modrinth == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        loader: ${{ fromJson(needs.build.outputs.loaders) }}
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      MODRINTH_ID: ${{ secrets.MODRINTH_ID }}
+      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download release files
+        uses: actions/download-artifact@v6
+        with:
+          name: release-files
+          path: release-files
+
+      - name: Load release config
+        run: cat .github/release/release.env >> "$GITHUB_ENV"
+
+      - name: Render changelog
+        run: envsubst '${VERSION}' < .github/release/CHANGELOG.md > "$RUNNER_TEMP/changelog.md"
+
+      - name: Check Modrinth config
+        if: ${{ env.MODRINTH_TOKEN != '' && env.MODRINTH_ID == '' }}
+        run: |
+          echo "::error::MODRINTH_TOKEN is set but MODRINTH_ID is empty -- nothing would be published. Pass MODRINTH_ID as a secret from the caller."
+          exit 1
+
+      - name: Publish to Modrinth
+        if: ${{ env.MODRINTH_TOKEN != '' }}
+        uses: Kira-NT/mc-publish@v3
+        with:
+          modrinth-id: ${{ env.MODRINTH_ID }}
+          modrinth-token: ${{ env.MODRINTH_TOKEN }}
+          files: release-files/${{ env.ARTIFACT }}-${{ matrix.loader }}-${{ env.VERSION }}.jar
+          name: ${{ env.MOD_NAME }} ${{ env.VERSION }} (${{ matrix.loader }})
+          version: ${{ env.VERSION }}-${{ matrix.loader }}
+          version-type: ${{ env.VERSION_TYPE }}
+          changelog-file: ${{ runner.temp }}/changelog.md
+
+  # CurseForge is fussier than Modrinth about game versions: it will not
+  # accept a version string it doesn't already know, and inference from jar
+  # metadata can produce ranges it rejects. GAME_VERSIONS in release.env
+  # overrides that inference when set; left empty, mc-publish infers as it
+  # does for Modrinth.
+  #
+  # Fans out over the built loaders for the same reason release-modrinth
+  # does: mc-publish reads loader/game-version metadata from a single jar per
+  # call, so a multi-loader files list silently loses everything but one
+  # loader's data.
+  #
+  # Gated like release-modrinth: a plain version tag, or an explicitly ticked
+  # manual run.
+  release-curseforge:
+    needs: [gate, build]
+    if: ${{ needs.gate.outputs.curseforge == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        loader: ${{ fromJson(needs.build.outputs.loaders) }}
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      CURSEFORGE_ID: ${{ secrets.CURSEFORGE_ID }}
+      CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download release files
+        uses: actions/download-artifact@v6
+        with:
+          name: release-files
+          path: release-files
+
+      - name: Load release config
+        run: |
+          cat .github/release/release.env >> "$GITHUB_ENV"
+
+          # GAME_VERSIONS in release.env is a flat comma-separated list (easier
+          # to read/edit there), but mc-publish's game-versions input wants a
+          # newline-separated block -- a comma-joined string is treated as one
+          # unrecognised version and CurseForge then has nothing to upload
+          # against. Read straight from the file (rather than sourcing it) so
+          # values with spaces (e.g. `MOD_NAME=Fire Sprinkler`) don't get run
+          # as a command.
+          {
+            echo "GAME_VERSIONS_LIST<<EOF"
+            sed -n 's/^GAME_VERSIONS=//p' .github/release/release.env | tr ',' '\n'
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Render changelog
+        run: envsubst '${VERSION}' < .github/release/CHANGELOG.md > "$RUNNER_TEMP/changelog.md"
+
+      - name: Check CurseForge config
+        if: ${{ env.CURSEFORGE_TOKEN != '' && env.CURSEFORGE_ID == '' }}
+        run: |
+          echo "::error::CURSEFORGE_TOKEN is set but CURSEFORGE_ID is empty -- nothing would be published. Pass CURSEFORGE_ID as a secret from the caller."
+          exit 1
+
+      - name: Publish to CurseForge
+        if: ${{ env.CURSEFORGE_TOKEN != '' }}
+        uses: Kira-NT/mc-publish@v3
+        with:
+          curseforge-id: ${{ env.CURSEFORGE_ID }}
+          curseforge-token: ${{ env.CURSEFORGE_TOKEN }}
+          files: release-files/${{ env.ARTIFACT }}-${{ matrix.loader }}-${{ env.VERSION }}.jar
+          name: ${{ env.MOD_NAME }} ${{ env.VERSION }} (${{ matrix.loader }})
+          version: ${{ env.VERSION }}-${{ matrix.loader }}
+          version-type: ${{ env.VERSION_TYPE }}
+          game-versions: ${{ env.GAME_VERSIONS_LIST }}
+          changelog-file: ${{ runner.temp }}/changelog.md
