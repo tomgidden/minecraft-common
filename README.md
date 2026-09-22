@@ -1,4 +1,4 @@
-# minecraft-mod-build-and-publish
+# minecraft-common
 
 Shared GitHub Actions pipeline for my Minecraft mods: builds the Fabric and/or
 NeoForge subprojects, then publishes to GitHub Releases, Modrinth and
@@ -33,7 +33,7 @@ on:
 
 jobs:
   call:
-    uses: tomgidden/minecraft-mod-build-and-publish/.github/workflows/build-and-release.yml@v1
+    uses: tomgidden/minecraft-common/.github/workflows/build-and-release.yml@v1
     permissions:
       contents: write
     with:
@@ -66,15 +66,45 @@ the build:
 |---|---|
 | `mod_name` | display name, e.g. `Trade School` |
 | `archives_base_name` | jar basename; jars are located as `<loader>/build/libs/<name>-<loader>-<VERSION>.jar` |
-| `game_versions` | **optional** comma-separated list for CurseForge, e.g. `26.1.2,26.2,26.3`. Omit to infer from the jar's metadata |
+| `game_versions` | **required** when publishing: comma-separated Minecraft versions, e.g. `26.1.2,26.2,26.3` |
 
 The release channel is *not* configured — it is derived from the tag, so it
 cannot drift from what is actually being released. (This replaces the old
 `.github/release/release.env`; delete that file when adopting this version.)
 
-`game_versions` is the one value that cannot be derived: CurseForge rejects any
-version string it doesn't already know, and a mod spanning 26.1.2 to 26.3 also
-has to list 26.2 by hand.
+`mod_id` is deliberately *not* used for jar names: it is the registry id, baked
+into saved worlds, while `archives_base_name` is what Gradle actually names jars
+from. Reading the latter is what makes the release jobs' globs match.
+
+### Why `game_versions` is required
+
+It is the one value that cannot be derived, and the failure mode of guessing is
+quiet rather than loud.
+
+Left unset, mc-publish falls back to the `minecraft` dependency in the jar's own
+metadata — but those manifests declare an **open-ended range** (`>=26.3 <27`),
+which it expands against its own version list using the default
+`releases | min-major | min-minor` filter. So:
+
+- the upper bound is open: once 26.4 ships, the *same jar* starts being
+  published as 26.4-compatible, without a rebuild and without you testing it;
+- the expansion depends on mc-publish's version list rather than yours, so it
+  can drift between runs of an unchanged jar.
+
+Nor can it be computed from `minecraft_version_min` and `minecraft_version`: a
+mod supporting 26.1.2, 26.2 and 26.3 has no way to derive the middle entry
+without a table of every MC release in between.
+
+The list is passed to **both** Modrinth and CurseForge, so the two sites cannot
+disagree about the same jar. (CurseForge is the stricter of the two — it rejects
+any version string it doesn't already know — but the input is shared, not
+CurseForge-specific.)
+
+Each comma-separated entry may itself be a range mc-publish understands
+(`[26.1.2,26.3]`, `>=26.3 <27`). A plain list of exact versions is preferred,
+since a range re-introduces exactly the drift described above. The commas are a
+`gradle.properties` convenience — one readable line instead of a YAML block —
+and are expanded to the newline-separated form mc-publish expects.
 
 Plus a `.github/release/` directory for prose:
 

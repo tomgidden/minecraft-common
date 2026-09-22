@@ -9,10 +9,14 @@
 #   mod_name            -- display name, e.g. "Trade School"
 #   archives_base_name  -- jar basename; the jars are globbed by it, so
 #                          reading the property Gradle itself names jars
-#                          from removes a whole class of silent mismatch
-#   game_versions       -- OPTIONAL comma-separated list for CurseForge,
-#                          e.g. 26.1.2,26.2,26.3. Omit to let mc-publish
-#                          infer from the jar's own metadata.
+#                          from removes a whole class of silent mismatch.
+#                          NOT mod_id, which is the registry id and may
+#                          differ (beaconobscura vs beacon-obscura).
+#   game_versions       -- comma-separated Minecraft versions, e.g.
+#                          26.1.2,26.2,26.3. REQUIRED when publishing:
+#                          inferring from the jar's open-ended range would
+#                          let a build claim versions released after it.
+#                          Passed to both Modrinth and CurseForge.
 #
 # The release channel is NOT configured: it is derived from the tag (see the
 # gate job), so it cannot drift from what is actually being released.
@@ -282,8 +286,8 @@ jobs:
             echo "ARTIFACT=$artifact"
           } >> "$GITHUB_ENV"
 
-          # game_versions is optional: left unset, mc-publish infers the game
-          # versions from the jar's own metadata.
+          # Checked in the publish jobs rather than here, so a build-only run
+          # (a non-version tag) still succeeds without it.
           {
             echo "mod_name=$mod_name"
             echo "artifact=$artifact"
@@ -434,6 +438,7 @@ jobs:
       MOD_NAME: ${{ needs.build.outputs.mod_name }}
       ARTIFACT: ${{ needs.build.outputs.artifact }}
       VERSION_TYPE: ${{ needs.gate.outputs.version_type }}
+      GAME_VERSIONS: ${{ needs.build.outputs.game_versions }}
       MODRINTH_ID: ${{ inputs.modrinth_id || secrets.MODRINTH_ID }}
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
     steps:
@@ -445,6 +450,22 @@ jobs:
         with:
           name: release-files
           path: release-files
+
+      # Same expansion as release-curseforge; see the comment there for why
+      # the list is explicit rather than inferred, and why it is stored
+      # comma-separated but passed newline-separated.
+      - name: Expand game versions
+        run: |
+          if [ -z "$GAME_VERSIONS" ]; then
+            echo "::error::game_versions is not set in gradle.properties. The jar's own metadata declares an open-ended range (e.g. minecraft \">=26.3 <27\"), which mc-publish would expand against its version list -- so this build could claim support for Minecraft versions released after it was built. Set e.g. game_versions=26.3"
+            exit 1
+          fi
+          {
+            echo "GAME_VERSIONS_LIST<<EOF"
+            printf '%s' "$GAME_VERSIONS" | tr ',' '\n'
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Render changelog
         run: envsubst '${VERSION}' < .github/release/CHANGELOG.md > "$RUNNER_TEMP/changelog.md"
@@ -465,17 +486,26 @@ jobs:
           name: ${{ env.MOD_NAME }} ${{ env.VERSION }} (${{ matrix.loader }})
           version: ${{ env.VERSION }}-${{ matrix.loader }}
           version-type: ${{ env.VERSION_TYPE }}
+          game-versions: ${{ env.GAME_VERSIONS_LIST }}
           changelog-file: ${{ runner.temp }}/changelog.md
 
-  # CurseForge is fussier than Modrinth about game versions: it will not
-  # accept a version string it doesn't already know, and inference from jar
-  # metadata can produce ranges it rejects. `game_versions` in
-  # gradle.properties overrides that inference when set; left unset,
-  # mc-publish infers as it does for Modrinth.
+  # game_versions is required, and is the one release value that cannot be
+  # derived. Left unset, mc-publish falls back to the `minecraft` dependency
+  # in the jar's own metadata -- but those manifests declare an open-ended
+  # range (`>=26.3 <27`), which it expands against its own version list under
+  # the default `releases | min-major | min-minor` filter. Two problems: the
+  # upper bound is open, so once 26.4 ships the SAME jar starts being
+  # published as 26.4-compatible without a rebuild; and the expansion depends
+  # on mc-publish's list rather than ours, so it can drift between runs.
+  # Hence the explicit list, and the hard failure when it is missing.
   #
-  # It is the one release value that cannot be derived: a mod supporting
-  # 26.1.2, 26.2 and 26.3 cannot have the middle entry computed from a
-  # min/current pair without a table of every MC release in between.
+  # It also cannot be computed from the min/current pair: a mod supporting
+  # 26.1.2, 26.2 and 26.3 has no way to derive the middle entry without a
+  # table of every MC release in between.
+  #
+  # CurseForge is the stricter of the two -- it rejects any version string it
+  # doesn't already know, where Modrinth is more forgiving -- but the list is
+  # passed to BOTH, so the two sites cannot disagree about the same jar.
   #
   # Fans out over the built loaders for the same reason release-modrinth
   # does: mc-publish reads loader/game-version metadata from a single jar per
@@ -509,13 +539,20 @@ jobs:
           name: release-files
           path: release-files
 
-      # game_versions is a flat comma-separated list in gradle.properties
-      # (easier to read and edit there), but mc-publish's game-versions input
-      # wants a newline-separated block -- a comma-joined string is treated as
-      # one unrecognised version, and CurseForge then has nothing to upload
-      # against.
+      # game_versions is stored as a flat comma-separated list in
+      # gradle.properties (one readable line, no YAML block), but mc-publish's
+      # game-versions input wants a newline-separated block -- a comma-joined
+      # string is treated as one unrecognised version, and CurseForge then has
+      # nothing to upload against. Each entry may itself be a range that
+      # mc-publish understands (`[26.1.2,26.3]`, `>=26.3 <27`); a plain list of
+      # exact versions is preferred, since a range re-introduces the drift
+      # described above.
       - name: Expand game versions
         run: |
+          if [ -z "$GAME_VERSIONS" ]; then
+            echo "::error::game_versions is not set in gradle.properties. The jar's own metadata declares an open-ended range (e.g. minecraft \">=26.3 <27\"), which mc-publish would expand against its version list -- so this build could claim support for Minecraft versions released after it was built. Set e.g. game_versions=26.3"
+            exit 1
+          fi
           {
             echo "GAME_VERSIONS_LIST<<EOF"
             printf '%s' "$GAME_VERSIONS" | tr ',' '\n'
