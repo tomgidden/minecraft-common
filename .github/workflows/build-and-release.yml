@@ -30,7 +30,11 @@
 #   workflow-update-* anything else      build only, nothing published
 #
 #   manual dispatch   build + a prerelease GitHub release; Modrinth and
-#                     CurseForge only if their box is ticked
+#                     CurseForge only if their box is ticked. This applies
+#                     whether the run was launched from a branch or from a
+#                     tag: a dispatch is judged by its boxes, never by the
+#                     tag's shape. Launched from a tag, the build is still
+#                     versioned after that tag.
 #
 # so an untagged run, or a tag that isn't a version number, is safe to use as
 # a test build: it publishes nothing to the mod sites unless asked.
@@ -96,7 +100,10 @@ jobs:
   #   (neither)  any other tag, e.g. workflow-update-26.0.2 -- build only
   #
   # A manual dispatch counts as a prerelease, so a test build never looks
-  # like a real one.
+  # like a real one -- and takes precedence over the tag shape, because a
+  # dispatch can be launched from a tag, and then the tick boxes, not the
+  # tag's name, decide what gets published. (The jars are still named after
+  # the tag in that case; see the VERSION logic in build.)
   #
   # github.ref_type/ref_name refer to the CALLER's ref, so tags work here
   # exactly as they did when this lived in the mod repo.
@@ -110,6 +117,7 @@ jobs:
     steps:
       - id: g
         env:
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
           IS_TAG: ${{ github.ref_type == 'tag' }}
           TAG: ${{ github.ref_name }}
           WANT_MODRINTH: ${{ inputs.modrinth }}
@@ -117,16 +125,20 @@ jobs:
         run: |
           gh=false; mr=false; cf=false; pre=false
 
-          if [ "$IS_TAG" = "true" ]; then
+          # Dispatch is checked FIRST, and on the event rather than the ref: a
+          # manual run can be launched from a tag as well as a branch, and when
+          # it is, ref_type is 'tag'. Testing the ref here instead sent such a
+          # run down the tag path, where the tick boxes are never read at all.
+          if [ "$IS_DISPATCH" = "true" ]; then
+            gh=true; pre=true                      # manual dispatch
+            [ "$WANT_MODRINTH" = "true" ] && mr=true
+            [ "$WANT_CURSEFORGE" = "true" ] && cf=true
+          elif [ "$IS_TAG" = "true" ]; then
             if printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
               gh=true; mr=true; cf=true            # public release
             elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9_]+|\+[0-9]+)$'; then
               gh=true; pre=true                    # github prerelease
             fi                                     # else: build only
-          else
-            gh=true; pre=true                      # manual dispatch
-            [ "$WANT_MODRINTH" = "true" ] && mr=true
-            [ "$WANT_CURSEFORGE" = "true" ] && cf=true
           fi
 
           {
