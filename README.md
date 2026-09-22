@@ -59,16 +59,29 @@ the whole workflow at validation time, before any job is scheduled.
 
 ## What each mod must provide
 
-A `.github/release/` directory:
+Values come from `gradle.properties`, which is already the source of truth for
+the build:
+
+| property | purpose |
+|---|---|
+| `mod_name` | display name, e.g. `Trade School` |
+| `archives_base_name` | jar basename; jars are located as `<loader>/build/libs/<name>-<loader>-<VERSION>.jar` |
+| `game_versions` | **optional** comma-separated list for CurseForge, e.g. `26.1.2,26.2,26.3`. Omit to infer from the jar's metadata |
+
+The release channel is *not* configured — it is derived from the tag, so it
+cannot drift from what is actually being released. (This replaces the old
+`.github/release/release.env`; delete that file when adopting this version.)
+
+`game_versions` is the one value that cannot be derived: CurseForge rejects any
+version string it doesn't already know, and a mod spanning 26.1.2 to 26.3 also
+has to list 26.2 by hand.
+
+Plus a `.github/release/` directory for prose:
 
 | file | purpose |
 |---|---|
-| `release.env` | `MOD_NAME`, `ARTIFACT`, `VERSION_TYPE`, `PRERELEASE`, `GAME_VERSIONS` |
 | `RELEASE.md` | GitHub release body; `${VERSION}` is substituted |
 | `CHANGELOG.md` | changelog for Modrinth/CurseForge; `${VERSION}` is substituted |
-
-`ARTIFACT` must match `archives_base_name` in `gradle.properties`, since jars
-are located as `<loader>/build/libs/<ARTIFACT>-<loader>-<VERSION>.jar`.
 
 Loaders are discovered from the repo layout — a loader is built only if its
 subproject directory exists — so Fabric-only and Fabric+NeoForge mods use the
@@ -97,26 +110,38 @@ create-only token fails with `401 ... editing version through v3 route`.
 
 ## What publishes when
 
-Every tag builds. The tag's shape decides what gets published:
+Every tag builds. Two separate questions decide the rest: the tag's **shape**
+says what kind of release it is, and the **trigger** says whether it publishes.
 
-| trigger | builds | GitHub release | Modrinth / CurseForge |
+| tag | channel | on tag push | on manual dispatch |
 |---|---|---|---|
-| tag `26.0.3` | yes | yes | yes |
-| tag `26.0.3-pre1` | yes | yes, as a **prerelease** | no |
-| tag `26.0.3+1` | yes | yes, as a **prerelease** | no |
-| tag `workflow-update-26.0.2` | yes | no | no |
-| manual dispatch | yes | yes, as a **prerelease** | only if ticked |
+| `26.0.3` | release | GitHub + Modrinth + CurseForge | per tick boxes |
+| `26.0.3+foo` | release | GitHub only | per tick boxes |
+| `26.0.3-beta1` | beta, **prerelease** | GitHub only | per tick boxes |
+| `26.0.3-alpha1` | alpha, **prerelease** | GitHub only | per tick boxes |
+| `workflow-update-26.0.2` | — | build only | build + GitHub |
 
-Tag patterns are strict: `^[0-9]+\.[0-9]+(\.[0-9]+)?$` for a release and
-`^[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9_]+|\+[0-9]+)$` for a prerelease.
-`v26.0.3` and `26.0.3-pre.1` (dot in the suffix) match neither, so they build
-and publish nothing.
+**A bare `26.0.3` is the only thing that ever publishes by itself.**
 
-`+N` is semver build metadata: a rebuild of an already-released version, for
-testing CI without inventing a version number. Semver ignores it for
-precedence — `26.0.3+1` *is* `26.0.3` — so it is deliberately capped at a
-GitHub prerelease and never reaches Modrinth or CurseForge, which would
-otherwise carry two entries claiming to be the same version.
+Tag patterns are strict: `^[0-9]+\.[0-9]+(\.[0-9]+)?$` for a release,
+with `+[A-Za-z0-9_.-]+` or `-[A-Za-z0-9_.]+` for the two suffixed forms.
+`v26.0.3` matches none of them, so it builds and publishes nothing.
+
+The channel sent to the mod sites is derived from the `-` suffix: `beta` for
+`-beta*`, `-rc*` and `-pre*`; `alpha` for `-alpha*` or any unrecognised suffix,
+since understating maturity is the harmless direction to fail.
+
+`+foo` is an **exceptional post-release patch** — a release-bug fix or very
+minor tweak, published by hand after deleting the base release. It counts as a
+real release rather than a prerelease, but never goes out automatically:
+pushing the tag only builds and makes a GitHub release, and reaching the mod
+sites takes a manual dispatch with the boxes ticked. (Semver says build
+metadata is ignored for precedence, but neither Modrinth nor CurseForge
+documents what it does with the string, so it stays under manual control.)
+
+A dispatch from a **branch** has no tag to be judged by, so it stays a
+prerelease and takes mc-publish's default channel — a test build never looks
+like a real one.
 
 On a version tag the **tag is authoritative**: the build passes
 `-Pmod_version=<tag>`, so jar names always match what the release jobs look

@@ -1,10 +1,24 @@
 # Shared build-and-release pipeline for tomgidden's Minecraft mods.
 #
 # Called by each mod repo's own .github/workflows/build-and-release.yml, which
-# is a thin stub -- see README.md for the stub to copy. Everything that differs
-# between mods lives in the calling repo's .github/release/:
+# is a thin stub -- see README.md for the stub to copy.
 #
-#   release.env   -- mod name, jar basename, release channel, game versions
+# Values that differ between mods come from the calling repo's
+# gradle.properties, which is already the source of truth for the build:
+#
+#   mod_name            -- display name, e.g. "Trade School"
+#   archives_base_name  -- jar basename; the jars are globbed by it, so
+#                          reading the property Gradle itself names jars
+#                          from removes a whole class of silent mismatch
+#   game_versions       -- OPTIONAL comma-separated list for CurseForge,
+#                          e.g. 26.1.2,26.2,26.3. Omit to let mc-publish
+#                          infer from the jar's own metadata.
+#
+# The release channel is NOT configured: it is derived from the tag (see the
+# gate job), so it cannot drift from what is actually being released.
+#
+# Prose lives in the calling repo's .github/release/:
+#
 #   RELEASE.md    -- body of the GitHub release
 #   CHANGELOG.md  -- changelog sent to Modrinth and CurseForge
 #
@@ -19,25 +33,26 @@
 # run replays that run's workflow files, not the current ones, so a fix here
 # needs a new run to take effect.)
 #
-# What runs depends on how the caller was triggered, and on the tag's shape.
-# Every tag builds; the tag name decides only what gets published:
+# Every tag builds. Two separate questions then decide the outcome: the tag's
+# shape says what KIND of release it is, and the trigger says WHETHER it
+# publishes. A bare version is the only thing that ever publishes by itself.
 #
-#   26.0.3            public release     GitHub release + Modrinth + CurseForge
-#   26.0.3-pre1       github prerelease  GitHub release only, marked prerelease
-#   26.0.3+1          github prerelease  ditto -- a rebuild of an already
-#                                        released version (semver build
-#                                        metadata; never reaches the mod sites)
-#   workflow-update-* anything else      build only, nothing published
+#                     kind                on tag push        on dispatch
+#   26.0.3            release             GitHub + MR + CF   per tick boxes
+#   26.0.3+foo        release             GitHub only        per tick boxes
+#   26.0.3-beta1      beta, prerelease    GitHub only        per tick boxes
+#   26.0.3-alpha1     alpha, prerelease   GitHub only        per tick boxes
+#   workflow-update-* not a version       build only         build + GitHub
 #
-#   manual dispatch   build + a prerelease GitHub release; Modrinth and
-#                     CurseForge only if their box is ticked. This applies
-#                     whether the run was launched from a branch or from a
-#                     tag: a dispatch is judged by its boxes, never by the
-#                     tag's shape. Launched from a tag, the build is still
-#                     versioned after that tag.
+# 26.0.3+foo is an exceptional post-release patch -- a release-bug fix or a
+# very minor tweak -- published by hand after deleting the base release, so it
+# is a real release rather than a prerelease. It never goes out automatically:
+# pushing the tag only builds and makes a GitHub release, and reaching the mod
+# sites takes a manual dispatch with the boxes ticked.
 #
-# so an untagged run, or a tag that isn't a version number, is safe to use as
-# a test build: it publishes nothing to the mod sites unless asked.
+# A dispatch from a branch has no tag to be judged by, so it stays a
+# prerelease and takes its channel from mc-publish's default: an untagged run,
+# or a tag that isn't a version number, is safe as a test build.
 
 name: Build and Release (shared)
 
@@ -90,20 +105,17 @@ jobs:
   # shape is matched here in bash instead -- and every tag is built, whatever
   # it's called.
   #
-  #   release    a plain version, e.g. 26.0.3 -- publish everywhere
-  #   prerelease a version with a -suffix (26.0.3-pre1) or +build metadata
-  #              (26.0.3+1) -- GitHub only, flagged as a prerelease. Semver
-  #              says +build is ignored for precedence, i.e. 26.0.3+1 IS
-  #              26.0.3, so it must never reach Modrinth/CurseForge: they
-  #              would carry two entries claiming to be the same version.
-  #              It exists for rebuilding an already-released version.
-  #   (neither)  any other tag, e.g. workflow-update-26.0.2 -- build only
+  # See the table at the top of this file for what each tag shape produces.
+  # In short: only a bare X.Y.Z auto-publishes; +build and -suffix tags make a
+  # GitHub release and wait for a manual dispatch to go further; anything else
+  # just builds.
   #
-  # A manual dispatch counts as a prerelease, so a test build never looks
-  # like a real one -- and takes precedence over the tag shape, because a
-  # dispatch can be launched from a tag, and then the tick boxes, not the
-  # tag's name, decide what gets published. (The jars are still named after
-  # the tag in that case; see the VERSION logic in build.)
+  # A manual dispatch decides only WHETHER a run publishes, never what kind of
+  # release it is -- the tag still supplies that, so a run launched from a tag
+  # is labelled the same either way, and the jars are still named after it
+  # (see the VERSION logic in build). A dispatch from a ref that is not a
+  # version tag has nothing to go on and stays a prerelease, so a test build
+  # never looks like a real one.
   #
   # github.ref_type/ref_name refer to the CALLER's ref, so tags work here
   # exactly as they did when this lived in the mod repo.
@@ -114,6 +126,8 @@ jobs:
       modrinth: ${{ steps.g.outputs.modrinth }}
       curseforge: ${{ steps.g.outputs.curseforge }}
       prerelease: ${{ steps.g.outputs.prerelease }}
+      version_type: ${{ steps.g.outputs.version_type }}
+      is_version: ${{ steps.g.outputs.is_version }}
     steps:
       - id: g
         env:
@@ -125,20 +139,57 @@ jobs:
         run: |
           gh=false; mr=false; cf=false; pre=false
 
-          # Dispatch is checked FIRST, and on the event rather than the ref: a
-          # manual run can be launched from a tag as well as a branch, and when
-          # it is, ref_type is 'tag'. Testing the ref here instead sent such a
-          # run down the tag path, where the tick boxes are never read at all.
+          # The tag's shape decides what KIND of release this is -- how it is
+          # labelled and whether it counts as a prerelease -- independently of
+          # WHETHER it publishes, which is decided below. A manual dispatch
+          # changes only the latter, so a run launched from a tag is labelled
+          # by that tag whichever way it was triggered.
+          #
+          #   26.0.3        release  the only shape that auto-publishes
+          #   26.0.3+foo    release  an exceptional post-release patch; the
+          #                          base release is deleted by hand first, so
+          #                          this is a real release, not a prerelease.
+          #                          Never automatic -- dispatch + tick boxes.
+          #   26.0.3-beta1  beta     prerelease
+          #   (other)       --       not a version tag: build only
+          #
+          # Modrinth and CurseForge accept only release/beta/alpha, so a "-"
+          # suffix is mapped onto those; an unrecognised one gets alpha, since
+          # understating maturity is the harmless direction to fail.
+          #
+          # vt is empty for a non-tag run (a dispatch from a branch), and
+          # then mc-publish falls back to its own default channel.
+          vt=""; is_version=false; auto=false
+          if [ "$IS_TAG" = "true" ]; then
+            if printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+              is_version=true; auto=true; vt=release
+            elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?\+[A-Za-z0-9_.-]+$'; then
+              is_version=true; vt=release          # manual-only patch release
+            elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?-[A-Za-z0-9_.]+$'; then
+              is_version=true; pre=true
+              case "$TAG" in
+                *-[Bb]eta*|*-[Rr][Cc]*|*-[Pp]re*) vt=beta ;;
+                *)                                vt=alpha ;;
+              esac
+            fi
+          fi
+
+          # Dispatch is judged on the EVENT, not the ref: a manual run can be
+          # launched from a tag as well as a branch, and when it is, ref_type
+          # is 'tag'. Testing the ref here instead sent such a run down the tag
+          # path, where the tick boxes were never read at all.
           if [ "$IS_DISPATCH" = "true" ]; then
-            gh=true; pre=true                      # manual dispatch
+            gh=true
             [ "$WANT_MODRINTH" = "true" ] && mr=true
             [ "$WANT_CURSEFORGE" = "true" ] && cf=true
-          elif [ "$IS_TAG" = "true" ]; then
-            if printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
-              gh=true; mr=true; cf=true            # public release
-            elif printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9_]+|\+[0-9]+)$'; then
-              gh=true; pre=true                    # github prerelease
-            fi                                     # else: build only
+            # A dispatch from a non-version ref has no tag to be judged by, so
+            # it stays a prerelease: a test build never looks like a real one.
+            [ "$is_version" = "true" ] || pre=true
+          elif [ "$is_version" = "true" ]; then
+            gh=true
+            if [ "$auto" = "true" ]; then
+              mr=true; cf=true                     # bare X.Y.Z only
+            fi
           fi
 
           {
@@ -146,9 +197,11 @@ jobs:
             echo "modrinth=$mr"
             echo "curseforge=$cf"
             echo "prerelease=$pre"
+            echo "version_type=$vt"
+            echo "is_version=$is_version"
           } >> "$GITHUB_OUTPUT"
 
-          echo "::notice::tag='${TAG}' -> github=$gh modrinth=$mr curseforge=$cf prerelease=$pre"
+          echo "::notice::tag='${TAG}' -> github=$gh modrinth=$mr curseforge=$cf prerelease=$pre version_type=${vt:-<unset>}"
 
   build:
     needs: gate
@@ -156,6 +209,11 @@ jobs:
     outputs:
       version: ${{ steps.version-out.outputs.version }}
       loaders: ${{ steps.loaders-out.outputs.loaders }}
+      # Read from gradle.properties once, here, so the release jobs never
+      # parse it themselves.
+      mod_name: ${{ steps.cfg.outputs.mod_name }}
+      artifact: ${{ steps.cfg.outputs.artifact }}
+      game_versions: ${{ steps.cfg.outputs.game_versions }}
     steps:
       # Checks out the CALLING mod repo at the ref that triggered the run --
       # which is what actions/checkout does by default from a called workflow.
@@ -189,14 +247,11 @@ jobs:
           restore-keys: |
             toolchains-${{ runner.os }}-
 
-      # release.env is plain KEY=value, so it can be appended straight to the
-      # step environment.
-      #
-      # VERSION comes from the tag, but only when the tag is actually a version
-      # (gate said it was publishable). A tag like workflow-update-26.0.2 is a
-      # marker, not a version, and naming jars after it would produce
-      # <artifact>-fabric-workflow-update-26.0.2.jar; those runs fall back to
-      # mod_version from gradle.properties, as a manual dispatch does.
+      # VERSION comes from the tag, but only when the tag is actually a version.
+      # A tag like workflow-update-26.0.2 is a marker, not a version, and naming
+      # jars after it would produce <artifact>-fabric-workflow-update-26.0.2.jar;
+      # those runs fall back to mod_version from gradle.properties, as a manual
+      # dispatch from a branch does.
       #
       # The set of loaders is derived from the repo layout: a loader is built
       # only if its subproject directory exists. GRADLE_TARGETS is the list of
@@ -204,17 +259,41 @@ jobs:
       - name: Load release config
         id: cfg
         env:
-          TAG_IS_VERSION: ${{ needs.gate.outputs.github }}
+          TAG_IS_VERSION: ${{ needs.gate.outputs.is_version }}
         run: |
-          if [ ! -f .github/release/release.env ]; then
-            echo "::error::.github/release/release.env not found in the calling repo."
+          if [ ! -f gradle.properties ]; then
+            echo "::error::gradle.properties not found in the calling repo."
             exit 1
           fi
-          cat .github/release/release.env >> "$GITHUB_ENV"
-          if [ "${{ github.ref_type }}" = "tag" ] && [ "$TAG_IS_VERSION" = "true" ]; then
+
+          # Read one property, trimming the trailing whitespace a hand-edited
+          # .properties file often carries. Deliberately NOT `source`: values
+          # like `mod_name=Trade School` would otherwise run as a command.
+          prop() { sed -n "s/^$1=//p" gradle.properties | head -1 | sed 's/[[:space:]]*$//'; }
+
+          mod_name=$(prop mod_name)
+          artifact=$(prop archives_base_name)
+          if [ -z "$mod_name" ] || [ -z "$artifact" ]; then
+            echo "::error::gradle.properties must define mod_name and archives_base_name."
+            exit 1
+          fi
+          {
+            echo "MOD_NAME=$mod_name"
+            echo "ARTIFACT=$artifact"
+          } >> "$GITHUB_ENV"
+
+          # game_versions is optional: left unset, mc-publish infers the game
+          # versions from the jar's own metadata.
+          {
+            echo "mod_name=$mod_name"
+            echo "artifact=$artifact"
+            echo "game_versions=$(prop game_versions)"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$TAG_IS_VERSION" = "true" ]; then
             echo "VERSION=${{ github.ref_name }}" >> "$GITHUB_ENV"
           else
-            echo "VERSION=$(sed -n 's/^mod_version=//p' gradle.properties)" >> "$GITHUB_ENV"
+            echo "VERSION=$(prop mod_version)" >> "$GITHUB_ENV"
           fi
 
           targets=""
@@ -290,9 +369,10 @@ jobs:
   # so a test build still leaves the jars somewhere downloadable -- but not for
   # a non-version tag, which builds and stops.
   #
-  # Marked as a prerelease whenever gate said so (a -suffix tag, or a manual
-  # dispatch), so a test build can't be mistaken for a real one. On a plain
-  # version tag, PRERELEASE from release.env decides as usual.
+  # Marked as a prerelease whenever gate said so -- a "-suffix" tag, or a
+  # dispatch from a ref that is not a version tag -- so a test build can't be
+  # mistaken for a real one. A bare X.Y.Z and a "+build" patch are both real
+  # releases and are not flagged.
   release-github:
     needs: [gate, build]
     if: ${{ needs.gate.outputs.github == 'true' }}
@@ -301,6 +381,7 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.build.outputs.version }}
+      MOD_NAME: ${{ needs.build.outputs.mod_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -310,9 +391,6 @@ jobs:
         with:
           name: release-files
           path: release-files
-
-      - name: Load release config
-        run: cat .github/release/release.env >> "$GITHUB_ENV"
 
       # envsubst is restricted to ${VERSION} so any other $... in the prose
       # (or a stray backtick-free shell-looking string) is left alone.
@@ -327,7 +405,7 @@ jobs:
           body_path: ${{ runner.temp }}/release-body.md
           files: release-files/*.jar
           fail_on_unmatched_files: true
-          prerelease: ${{ needs.gate.outputs.prerelease == 'true' || env.PRERELEASE == 'true' }}
+          prerelease: ${{ needs.gate.outputs.prerelease == 'true' }}
 
   # mc-publish infers loaders/game-versions/dependencies from a single jar's
   # own metadata (fabric.mod.json / neoforge.mods.toml) per call, so a
@@ -336,11 +414,11 @@ jobs:
   # of the loaders build actually produced, publishing one version per loader
   # (matching the existing 26.2-fabric / 26.2-neoforge versions on Modrinth).
   #
-  # Only runs for a plain version tag (26.0.3 -- not 26.0.3-pre1), or when a
-  # manual run explicitly ticks the Modrinth box; the step is additionally
-  # skipped when MODRINTH_TOKEN is unset, so a fork still builds and makes a
-  # GitHub release. (The token check has to be at step level: `secrets` is not
-  # available to a job-level `if:`.)
+  # Only runs for a bare version tag (26.0.3 -- not 26.0.3-pre1 or 26.0.3+foo),
+  # or when a manual run explicitly ticks the Modrinth box; the step is
+  # additionally skipped when MODRINTH_TOKEN is unset, so a fork still builds
+  # and makes a GitHub release. (The token check has to be at step level:
+  # `secrets` is not available to a job-level `if:`.)
   #
   # The project id arrives as an input because a called workflow cannot see the
   # caller's `vars`; the token arrives via `secrets: inherit`.
@@ -353,6 +431,9 @@ jobs:
         loader: ${{ fromJson(needs.build.outputs.loaders) }}
     env:
       VERSION: ${{ needs.build.outputs.version }}
+      MOD_NAME: ${{ needs.build.outputs.mod_name }}
+      ARTIFACT: ${{ needs.build.outputs.artifact }}
+      VERSION_TYPE: ${{ needs.gate.outputs.version_type }}
       MODRINTH_ID: ${{ inputs.modrinth_id || secrets.MODRINTH_ID }}
       MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
     steps:
@@ -364,9 +445,6 @@ jobs:
         with:
           name: release-files
           path: release-files
-
-      - name: Load release config
-        run: cat .github/release/release.env >> "$GITHUB_ENV"
 
       - name: Render changelog
         run: envsubst '${VERSION}' < .github/release/CHANGELOG.md > "$RUNNER_TEMP/changelog.md"
@@ -391,16 +469,20 @@ jobs:
 
   # CurseForge is fussier than Modrinth about game versions: it will not
   # accept a version string it doesn't already know, and inference from jar
-  # metadata can produce ranges it rejects. GAME_VERSIONS in release.env
-  # overrides that inference when set; left empty, mc-publish infers as it
-  # does for Modrinth.
+  # metadata can produce ranges it rejects. `game_versions` in
+  # gradle.properties overrides that inference when set; left unset,
+  # mc-publish infers as it does for Modrinth.
+  #
+  # It is the one release value that cannot be derived: a mod supporting
+  # 26.1.2, 26.2 and 26.3 cannot have the middle entry computed from a
+  # min/current pair without a table of every MC release in between.
   #
   # Fans out over the built loaders for the same reason release-modrinth
   # does: mc-publish reads loader/game-version metadata from a single jar per
   # call, so a multi-loader files list silently loses everything but one
   # loader's data.
   #
-  # Gated like release-modrinth: a plain version tag, or an explicitly ticked
+  # Gated like release-modrinth: a bare version tag, or an explicitly ticked
   # manual run.
   release-curseforge:
     needs: [gate, build]
@@ -411,6 +493,10 @@ jobs:
         loader: ${{ fromJson(needs.build.outputs.loaders) }}
     env:
       VERSION: ${{ needs.build.outputs.version }}
+      MOD_NAME: ${{ needs.build.outputs.mod_name }}
+      ARTIFACT: ${{ needs.build.outputs.artifact }}
+      VERSION_TYPE: ${{ needs.gate.outputs.version_type }}
+      GAME_VERSIONS: ${{ needs.build.outputs.game_versions }}
       CURSEFORGE_ID: ${{ inputs.curseforge_id || secrets.CURSEFORGE_ID }}
       CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
     steps:
@@ -423,20 +509,17 @@ jobs:
           name: release-files
           path: release-files
 
-      - name: Load release config
+      # game_versions is a flat comma-separated list in gradle.properties
+      # (easier to read and edit there), but mc-publish's game-versions input
+      # wants a newline-separated block -- a comma-joined string is treated as
+      # one unrecognised version, and CurseForge then has nothing to upload
+      # against.
+      - name: Expand game versions
         run: |
-          cat .github/release/release.env >> "$GITHUB_ENV"
-
-          # GAME_VERSIONS in release.env is a flat comma-separated list (easier
-          # to read/edit there), but mc-publish's game-versions input wants a
-          # newline-separated block -- a comma-joined string is treated as one
-          # unrecognised version and CurseForge then has nothing to upload
-          # against. Read straight from the file (rather than sourcing it) so
-          # values with spaces (e.g. `MOD_NAME=Fire Sprinkler`) don't get run
-          # as a command.
           {
             echo "GAME_VERSIONS_LIST<<EOF"
-            sed -n 's/^GAME_VERSIONS=//p' .github/release/release.env | tr ',' '\n'
+            printf '%s' "$GAME_VERSIONS" | tr ',' '\n'
+            echo ""
             echo "EOF"
           } >> "$GITHUB_ENV"
 
