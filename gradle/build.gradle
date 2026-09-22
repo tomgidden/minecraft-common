@@ -1,0 +1,10 @@
+plugins {
+    id 'groovy-gradle-plugin'
+}
+
+// Groovy DSL precompiled script plugins: each .gradle file in
+// src/main/groovy becomes a plugin id, e.g. cx.gid.minecraft.mod.gradle
+// -> `plugins { id 'cx.gid.minecraft.mod' }`.
+repositories {
+    gradlePluginPortal()
+}

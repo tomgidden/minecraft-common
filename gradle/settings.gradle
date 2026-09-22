@@ -1,0 +1,5 @@
+// Standalone build producing the convention plugins the mods apply. It is
+// consumed as an included build (see each mod's settings.gradle), so nothing
+// needs publishing: Gradle builds it from source and the mods pick up edits
+// immediately.
+rootProject.name = 'minecraft-conventions'

@@ -1,0 +1,272 @@
+// Shared root-project conventions for tomgidden's Minecraft mods.
+//
+// Applied by each mod's root build.gradle as:
+//
+//     plugins { id 'cx.gid.minecraft.mod' }
+//
+// Everything here was previously copy-pasted into all five mods, where it
+// drifted. A mod that needs something extra adds it alongside this plugin
+// rather than editing a copy.
+//
+// Expects, in gradle.properties:
+//
+//   mod_id, mod_name, mod_group, mod_version
+//   minecraft_version, minecraft_version_min
+//   minecraft_publish_for_versions
+//   archives_base_name             (optional; defaults to mod_id)
+
+// ---------------------------------------------------------------- versions
+
+// The Minecraft versions this build is PUBLISHED for, i.e. what Modrinth and
+// CurseForge advertise. Three properties, three different jobs:
+//
+//   minecraft_version              what we COMPILE against (one version)
+//   minecraft_version_min          what the game ENFORCES  (a floor, into
+//                                  fabric.mod.json / neoforge.mods.toml)
+//   minecraft_publish_for_versions what we CLAIM           (a tested set)
+//
+// The claim cannot be derived from the floor. The manifests declare an
+// open-ended range (">=26.3 <27") so a point release doesn't lock the mod
+// out -- correct for the loader, but as a storefront claim it would assert
+// support for versions that don't exist yet, and the same unchanged jar
+// would start advertising 26.4 the day 26.4 ships. Nor can the middle of a
+// span be guessed: expanding ">=26.1.2 <27" to "26.1.2, 26.2, 26.3" needs a
+// table of every MC release, which Gradle hasn't got. (mc-publish has one,
+// and resolves whatever it is given into each site's own tags -- which is
+// why one property serves both Modrinth and CurseForge.)
+//
+// So it is written by hand, and checked here against the two ends it must
+// agree with.
+
+// Numeric compare, so 26.10 sorts after 26.9 rather than before it.
+def cmpVersion = { String a, String b ->
+    def parts = { String v ->
+        v.split(/\./).collect { def m = (it =~ /^\d+/); m ? m[0] as int : 0 }
+    }
+    def pa = parts(a), pb = parts(b)
+    for (int i = 0; i < Math.max(pa.size(), pb.size()); i++) {
+        int x = i < pa.size() ? pa[i] : 0
+        int y = i < pb.size() ? pb[i] : 0
+        if (x != y) return x <=> y
+    }
+    0
+}
+
+// True if `want` is covered by one entry: an exact match, or inside a bounded
+// range in Maven/mc-publish notation -- [a,b] inclusive, (a,b) exclusive.
+def versionCovered = { List entries, String want ->
+    entries.any { e ->
+        def m = e =~ /^([\[\(])\s*([^,\s]*)\s*,\s*([^,\]\)\s]*)\s*([\]\)])$/
+        if (!m) return e == want
+        def lo = m[0][2], hi = m[0][3]
+        def loOk = !lo || (m[0][1] == '[' ? cmpVersion(want, lo) >= 0 : cmpVersion(want, lo) > 0)
+        def hiOk = !hi || (m[0][4] == ']' ? cmpVersion(want, hi) <= 0 : cmpVersion(want, hi) < 0)
+        loOk && hiOk
+    }
+}
+
+def validatePublishVersions = { ->
+    def raw = project.findProperty('minecraft_publish_for_versions')
+    if (!raw?.trim()) {
+        throw new GradleException(
+            "minecraft_publish_for_versions is not set in gradle.properties.\n" +
+            "  It is the set of Minecraft versions this build is published for,\n" +
+            "  e.g. minecraft_publish_for_versions=${project.minecraft_version}")
+    }
+    def entries = raw.split(',').collect { it.trim() }.findAll { it }
+
+    [['minecraft_version', project.minecraft_version],
+     ['minecraft_version_min', project.minecraft_version_min]].each { name, want ->
+        if (!versionCovered(entries, want as String)) {
+            throw new GradleException(
+                "minecraft_publish_for_versions does not cover ${name} (${want}).\n" +
+                "  minecraft_publish_for_versions = ${entries.join(', ')}\n" +
+                "  minecraft_version              = ${project.minecraft_version}\n" +
+                "  minecraft_version_min          = ${project.minecraft_version_min}\n" +
+                "  Publishing would advertise a version set that excludes ${want}.")
+        }
+    }
+}
+ext.validatePublishVersions = validatePublishVersions
+
+// --------------------------------------------------------------- projects
+
+subprojects {
+    group = project.mod_group
+    version = project.mod_version
+
+    // Jar basename. mod_id is the default and the usual case; a mod only sets
+    // archives_base_name if its jars must differ from its registry id.
+    // Deliberately NOT Gradle's own default (rootProject.name), which is the
+    // directory name and often hyphenated where mod_id is not -- that
+    // mismatch would have the release workflow globbing for a jar that the
+    // build never produced.
+    ext.archives_base = project.findProperty('archives_base_name') ?: project.mod_id
+
+    plugins.withId('java') {
+        java {
+            sourceCompatibility = JavaVersion.VERSION_25
+            targetCompatibility = JavaVersion.VERSION_25
+            toolchain {
+                languageVersion = JavaLanguageVersion.of(25)
+            }
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        it.options.encoding = 'UTF-8'
+        it.options.release = 25
+    }
+
+    // Validate whenever a jar task is SCHEDULED, rather than in a doFirst: an
+    // up-to-date jar skips its actions, so a doFirst would silently not run
+    // after an edit that didn't dirty the task -- exactly the case this check
+    // exists to catch. Still not configuration time, so `clean`, `tasks` and
+    // IDE sync keep working mid-edit.
+    tasks.withType(Jar).configureEach { t ->
+        gradle.taskGraph.whenReady { graph ->
+            if (graph.hasTask(t)) rootProject.validatePublishVersions()
+        }
+    }
+}
+
+// ----------------------------------------------------------------- deploy
+
+/**
+ * Copies the built jars into local devserver mods directories.
+ *
+ * `./gradlew deploy` builds both loaders and installs both. Deploying the pair together
+ * is the point: a session spent testing one loader while the other's jar silently ages is
+ * how a playtest ends up describing behaviour from a build that no longer exists — which
+ * cost an evening once, chasing three theories about code that was not running.
+ *
+ * Destinations come from the DEVSERVERS environment variable, colon-separated, and are
+ * deliberately *not* a committed property — they describe one developer's machine, not
+ * the project:
+ *
+ *     export DEVSERVERS=../devserver/26.2-fabric/mods:../devserver/26.2-neoforge/mods
+ *
+ * Each jar goes to every listed directory that could plausibly want it: a directory is a
+ * candidate if it already holds a jar of the same name, or if its path names the loader.
+ * That way one variable serves both loaders without saying which is which, and a
+ * directory belonging to some other setup is left alone.
+ */
+def deployJars = { Project root ->
+    def raw = System.getenv('DEVSERVERS')
+    if (!raw?.trim()) {
+        root.logger.lifecycle('deploy: DEVSERVERS is not set, nothing to do')
+        root.logger.lifecycle('deploy: e.g. export DEVSERVERS=../devserver/26.2-fabric/mods:../devserver/26.2-neoforge/mods')
+        return
+    }
+
+    def dests = raw.split(File.pathSeparator)
+        .collect { it.trim() }.findAll { it }.collect { root.file(it) }
+
+    def missing = dests.findAll { !it.isDirectory() }
+    if (missing) {
+        // A wrong path means the jar lands where nothing reads it, which is the silent
+        // failure this task exists to prevent. Say so rather than carrying on.
+        throw new GradleException('deploy: not a directory: ' + missing.join(', '))
+    }
+
+    int copied = 0
+    ['fabric', 'neoforge'].each { loader ->
+        if (root.findProject(":${loader}") == null) return
+        def jar = root.project(":${loader}").tasks.named('jar').get()
+            .archiveFile.get().asFile
+        if (!jar.isFile()) throw new GradleException("deploy: ${loader} jar not found at ${jar}")
+
+        dests.findAll { dest ->
+            new File(dest, jar.name).isFile() || dest.path.contains(loader)
+        }.each { dest ->
+            def target = new File(dest, jar.name)
+            java.nio.file.Files.copy(jar.toPath(), target.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            root.logger.lifecycle("deploy: ${target}")
+            copied++
+        }
+    }
+
+    if (copied == 0) {
+        root.logger.warn('deploy: none of the DEVSERVERS directories matched a loader; '
+            + 'nothing was copied')
+    }
+}
+
+tasks.register('deploy') {
+    group = 'distribution'
+    description = 'Builds both loaders and copies their jars to $DEVSERVERS'
+    dependsOn ':fabric:build', ':neoforge:build'
+    doLast { deployJars(project) }
+}
+
+// -------------------------------------------------------------- distclean
+
+/**
+ * Removes everything the build produces, back to what a fresh clone contains.
+ *
+ * `gradle clean` only removes each project's own build directory. It leaves the
+ * Gradle caches, Loom's decompiled-Minecraft cache, IDE output directories and
+ * run directories -- several hundred megabytes on a working checkout, and the
+ * usual reason a "clean" build still picks up something stale.
+ *
+ * Deliberately conservative: it deletes a fixed list of known build outputs
+ * rather than anything `git clean` would remove, because .gitignore also covers
+ * files that are precious (a local config.py, IDE settings someone has tuned).
+ * Being asked to clean a build must never cost someone their own untracked work.
+ *
+ * Run as `./gradlew distclean`. The Gradle daemon holds .gradle open on Windows
+ * and sometimes on macOS, so a failure to delete it is reported rather than
+ * being treated as fatal -- `--no-daemon` or `./gradlew --stop` first if it
+ * matters.
+ */
+tasks.register('distclean') {
+    group = 'build'
+    description = 'Delete all build output, caches and IDE artifacts (more than clean)'
+
+    // Paths are resolved at configuration time; the deletion itself happens in
+    // the action, so the task still honours --dry-run.
+    def rootDir = project.rootDir
+    def targets = ['.gradle', 'build', 'bin', 'out', 'run', 'runs', '.loom-cache']
+    def projectDirs = [rootDir] + subprojects.collect { it.projectDir }
+
+    // A local closure rather than an extension on File: adding a method to a
+    // JDK class from a build script leaks into every other script in the
+    // build, and is a nuisance to find when something else then relies on it.
+    def sizeOf
+    sizeOf = { File f ->
+        if (!f.isDirectory()) {
+            return f.length()
+        }
+        def kids = f.listFiles()
+        kids == null ? 0L : kids.sum { sizeOf(it) } ?: 0L
+    }
+
+    doLast {
+        long freed = 0
+        int removed = 0
+
+        projectDirs.each { dir ->
+            targets.each { name ->
+                def victim = new File(dir, name)
+                if (!victim.exists()) {
+                    return
+                }
+                long size = sizeOf(victim)
+                if (victim.deleteDir()) {
+                    freed += size
+                    removed++
+                    logger.lifecycle("removed ${rootDir.toPath().relativize(victim.toPath())}")
+                } else {
+                    logger.warn("could not remove ${victim} (a running Gradle daemon may hold it open)")
+                }
+            }
+        }
+
+        if (removed == 0) {
+            logger.lifecycle('nothing to remove; already clean')
+        } else {
+            logger.lifecycle(String.format('removed %d directories, freeing %.1f MB', removed, freed / 1048576.0))
+        }
+    }
+}
